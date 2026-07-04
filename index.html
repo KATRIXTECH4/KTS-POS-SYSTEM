@@ -297,6 +297,28 @@
   .checkout-btn{width:100%;padding:13px 0;border:none;border-radius:7px;background:var(--green);color:#fff;font-weight:700;font-size:14px;}
   .checkout-btn:hover:not(:disabled){background:var(--green-dark);}
   .checkout-btn:disabled{opacity:.4;cursor:not-allowed;}
+
+  /* ---------- M-PESA PAYMENT UI ---------- */
+  .pay-toggle{display:flex;gap:8px;padding:0 20px 14px;}
+  .pay-toggle button{
+    flex:1;padding:9px 0;border-radius:7px;border:1px solid var(--border);
+    background:#fff;color:var(--text-muted);font-weight:600;font-size:12.5px;
+  }
+  .pay-toggle button.active{border-color:var(--green);color:var(--green);background:var(--green-tint);}
+  .mpesa-box{margin:0 20px 14px;padding:14px;border:1px solid var(--border);border-radius:9px;background:#fff;}
+  .mpesa-box label{display:block;font-size:11.5px;font-weight:600;color:var(--text-muted);margin-bottom:6px;}
+  .mpesa-box input{
+    width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:6px;
+    font-size:14px;color:var(--text);outline:none;margin-bottom:10px;
+  }
+  .mpesa-waiting{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--text-muted);padding:4px 0 10px;}
+  .mpesa-spinner{
+    width:16px;height:16px;border-radius:50%;flex-shrink:0;
+    border:2px solid var(--gold-tint);border-top-color:var(--gold);
+    animation:mpspin .8s linear infinite;
+  }
+  @keyframes mpspin{to{transform:rotate(360deg);}}
+  .mpesa-cancel{width:100%;padding:9px 0;border:1px solid var(--border);border-radius:7px;background:#fff;color:var(--text-muted);font-size:12.5px;font-weight:600;}
   .toast{
     position:fixed;bottom:26px;left:50%;transform:translateX(-50%);background:var(--ink);color:#fff;
     padding:12px 20px;border-radius:8px;font-size:13px;font-weight:600;box-shadow:0 12px 30px rgba(0,0,0,.3);
@@ -977,11 +999,58 @@ function SalesPage({products, sales, user, storeName, onCompleteSale}){
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
+  const [payMethod, setPayMethod] = useState("cash"); // "cash" | "mpesa"
+  const [mpesaStage, setMpesaStage] = useState("idle"); // idle | phone | waiting | failed
+  const [mpesaPhone, setMpesaPhone] = useState("");
+  const [mpesaError, setMpesaError] = useState("");
+  const [checkoutRequestId, setCheckoutRequestId] = useState(null);
+
   useEffect(()=>{
     if (!toast) return;
     const t = setTimeout(()=>setToast(""), 2200);
     return ()=>clearTimeout(t);
   }, [toast]);
+
+  // Poll Supabase for the STK Push result while we're waiting on the customer's phone.
+  useEffect(()=>{
+    if (mpesaStage !== "waiting" || !checkoutRequestId) return;
+    let cancelled = false;
+    let elapsed = 0;
+    const POLL_MS = 3000;
+    const TIMEOUT_MS = 90000;
+
+    const tick = async () => {
+      const {data, error} = await sb.rpc("get_payment_status", {p_checkout_request_id: checkoutRequestId});
+      if (cancelled) return;
+      const row = Array.isArray(data) ? data[0] : data;
+      if (!error && row?.status === "success"){
+        setMpesaStage("idle");
+        setBusy(true);
+        const items = cart.map(i => ({product_id: i.id, qty: i.qty}));
+        const {error: saleErr} = await onCompleteSale(items);
+        setBusy(false);
+        if (saleErr){ setErr(saleErr.message.replace(/^.*: /, "")); return; }
+        setCart([]);
+        setToast("Paid via M-Pesa" + (row.mpesa_receipt ? " — " + row.mpesa_receipt : "") + " · " + fmt(total));
+        return;
+      }
+      if (!error && row?.status === "failed"){
+        setMpesaStage("failed");
+        setMpesaError(row.result_desc || "Payment was not completed.");
+        return;
+      }
+      elapsed += POLL_MS;
+      if (elapsed >= TIMEOUT_MS){
+        setMpesaStage("failed");
+        setMpesaError("No response from the customer's phone. Ask them to check for the prompt, or try again.");
+        return;
+      }
+      timer = setTimeout(tick, POLL_MS);
+    };
+    let timer = setTimeout(tick, POLL_MS);
+    return () => { cancelled = true; clearTimeout(timer); };
+    // eslint-disable-next-line
+  }, [mpesaStage, checkoutRequestId]);
 
   const addToCart = (p) => {
     setCart(c => {
@@ -1014,6 +1083,41 @@ function SalesPage({products, sales, user, storeName, onCompleteSale}){
     if (error){ setErr(error.message.replace(/^.*: /, "")); return; }
     setCart([]);
     setToast("Sale completed — " + fmt(total));
+  };
+
+  const sendMpesaPrompt = async () => {
+    const digits = mpesaPhone.replace(/\D/g, "");
+    const validLocal = /^0[71]\d{8}$/.test(digits);
+    const validIntl = /^254[71]\d{8}$/.test(digits);
+    if (!validLocal && !validIntl){
+      setMpesaError("Enter a valid Safaricom number, e.g. 07XXXXXXXX");
+      return;
+    }
+    setMpesaError("");
+    setBusy(true);
+    const {data, error} = await sb.functions.invoke("initiate-stk-push", {
+      body: {
+        phone: digits,
+        amount: total,
+        accountRef: storeName,
+        description: "POS sale",
+      },
+    });
+    setBusy(false);
+    if (error || data?.error){
+      setMpesaStage("failed");
+      setMpesaError(data?.error || error.message || "Could not send the M-Pesa prompt. Try again.");
+      return;
+    }
+    setCheckoutRequestId(data.checkoutRequestId);
+    setMpesaStage("waiting");
+  };
+
+  const resetMpesa = () => {
+    setMpesaStage("idle");
+    setMpesaPhone("");
+    setMpesaError("");
+    setCheckoutRequestId(null);
   };
 
   const filtered = products.filter(p => p.name.toLowerCase().includes(query.toLowerCase()));
@@ -1067,8 +1171,52 @@ function SalesPage({products, sales, user, storeName, onCompleteSale}){
           <div className="row"><span>Items</span><span>{cart.reduce((a,i)=>a+i.qty,0)}</span></div>
           <div className="row grand"><span>Total</span><span>{fmt(total)}</span></div>
         </div>
+
+        <div className="pay-toggle">
+          <button
+            className={payMethod==="cash" ? "active" : ""}
+            onClick={()=>{ setPayMethod("cash"); resetMpesa(); }}
+          >Cash</button>
+          <button
+            className={payMethod==="mpesa" ? "active" : ""}
+            onClick={()=>setPayMethod("mpesa")}
+          >M-Pesa</button>
+        </div>
+
+        {payMethod==="mpesa" && mpesaStage==="phone" && (
+          <div className="mpesa-box">
+            <label>Buyer's M-Pesa number</label>
+            <input placeholder="07XX XXX XXX" value={mpesaPhone} onChange={e=>setMpesaPhone(e.target.value)}/>
+            {mpesaError && <div className="login-error" style={{marginBottom:10}}>{mpesaError}</div>}
+            <button className="checkout-btn" disabled={busy} onClick={sendMpesaPrompt}>{busy ? "Sending prompt…" : "Send STK push"}</button>
+          </div>
+        )}
+
+        {payMethod==="mpesa" && mpesaStage==="waiting" && (
+          <div className="mpesa-box">
+            <div className="mpesa-waiting">
+              <div className="mpesa-spinner"></div>
+              Waiting for {mpesaPhone} to enter their M-Pesa PIN…
+            </div>
+            <button className="mpesa-cancel" onClick={resetMpesa}>Cancel</button>
+          </div>
+        )}
+
+        {payMethod==="mpesa" && mpesaStage==="failed" && (
+          <div className="mpesa-box">
+            <div className="login-error" style={{marginBottom:10}}>{mpesaError}</div>
+            <button className="checkout-btn" onClick={()=>setMpesaStage("phone")}>Try again</button>
+          </div>
+        )}
+
         <div className="receipt-foot">
-          <button className="checkout-btn" disabled={cart.length===0 || busy} onClick={completeSale}>{busy ? "Completing…" : "Complete sale"}</button>
+          {payMethod==="cash" ? (
+            <button className="checkout-btn" disabled={cart.length===0 || busy} onClick={completeSale}>{busy ? "Completing…" : "Complete sale"}</button>
+          ) : (
+            mpesaStage==="idle" && (
+              <button className="checkout-btn" disabled={cart.length===0 || busy} onClick={()=>setMpesaStage("phone")}>Pay with M-Pesa</button>
+            )
+          )}
         </div>
       </div>
 
