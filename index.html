@@ -1101,12 +1101,25 @@ function SalesPage({products, sales, user, storeName, onCompleteSale}){
         amount: total,
         accountRef: storeName,
         description: "POS sale",
+        staffToken: user.token,
       },
     });
     setBusy(false);
-    if (error || data?.error){
+    if (error){
+      // supabase-js hides the Edge Function's actual error message behind a
+      // generic "non-2xx status code" unless you read the raw response yourself.
+      let msg = "Could not send the M-Pesa prompt. Try again.";
+      try {
+        const body = await error.context.json();
+        if (body?.error) msg = body.error;
+      } catch (_) { /* keep the generic fallback message */ }
       setMpesaStage("failed");
-      setMpesaError(data?.error || error.message || "Could not send the M-Pesa prompt. Try again.");
+      setMpesaError(msg);
+      return;
+    }
+    if (data?.error){
+      setMpesaStage("failed");
+      setMpesaError(data.error);
       return;
     }
     setCheckoutRequestId(data.checkoutRequestId);
